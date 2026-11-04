@@ -1,0 +1,39 @@
+name: update-feeds
+
+on:
+  schedule:
+    - cron: '30 22 * * *'   # 每天北京时间 06:30
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feeds
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Restore abstract cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: abstracts-${{ github.run_id }}
+          restore-keys: abstracts-
+      - name: Build feeds
+        run: node build.js --out docs
+      - name: Publish feeds
+        run: |
+          rm -f docs/result.json
+          git config user.name "feed-bot"
+          git config user.email "feed-bot@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "Update feeds"
+          git push
