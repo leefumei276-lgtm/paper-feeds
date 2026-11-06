@@ -12,6 +12,9 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((a, x, i, all) => {
 const daysAgo = n => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
 const SINCE = args.since || daysAgo(150);
 const SSRN_SINCE = args['ssrn-since'] || daysAgo(10);
+const T5_SINCE = args['t5-since'] || daysAgo(365);
+const ONLY_TOP5 = process.argv.includes('--only-top5');
+const TOP5 = new Set(['American Economic Review', 'Econometrica', 'Journal of Political Economy', 'Quarterly Journal of Economics', 'Review of Economic Studies']);
 const OUT = args.out || path.join(__dirname, 'out');
 const CACHE_FILE = path.join(__dirname, 'cache', 'repec-abstracts.json');
 const UA = { 'User-Agent': 'literature-feed/1.0' };
@@ -26,8 +29,9 @@ const JOURNALS = [
   ['Omega', '0305-0483', 'jomega'], ['IJPE', '0925-5273', 'proeco'], ['EJOR', '0377-2217', 'ejores'],
   ['Transportation Research Part E', '1366-5545', 'transe'], ['Decision Support Systems', '0167-9236', 'decsup'],
   ['Naval Research Logistics', '0894-069X'], ['Decision Sciences', '0011-7315'],
-  ['Econometrica', '0012-9682'], ['Journal of Political Economy', '0022-3808'],
-  ['Quarterly Journal of Economics', '0033-5533'], ['Review of Economic Studies', '0034-6527'],
+  ['American Economic Review', '0002-8282', 'aea/aecrev'],
+  ['Econometrica', '0012-9682', 'wly/emetrp'], ['Journal of Political Economy', '0022-3808', 'ucp/jpolec'],
+  ['Quarterly Journal of Economics', '0033-5533', 'oup/qjecon'], ['Review of Economic Studies', '0034-6527', 'oup/restud'],
   ['RAND Journal of Economics', '0741-6261'], ['JEMS', '1058-6407'],
   ['IJIO', '0167-7187', 'indorg'], ['Games and Economic Behavior', '0899-8256', 'gamebe'],
   ['Information Economics and Policy', '0167-6245', 'iepoli'],
@@ -116,6 +120,56 @@ function classify(p) {
   return { bin: 'B', label: '', topics, evidence: [] };
 }
 
+// ---------- Top 5 分类：不限主题，只判断方法 ----------
+// 这里不用单独的 equilibrium，因为宏观和增长论文里的 equilibrium 不代表博弈论
+const T5_HARD = [
+  [/game[- ]theor/i, 'game theory'], [/\bgames?\b/i, 'game'], [/stackelberg/i, 'Stackelberg'], [/\bnash\b/i, 'Nash'], [/subgame/i, 'subgame'],
+  [/perfect bayesian|sequential equilibri|cursed equilibri|correlated equilibri|bayes(ian)?[- ]nash|mixed[- ]strateg|dominant[- ]strateg|best[- ]respon|level-k|solution concept|extensive[- ]form/i, 'equilibrium concept'],
+  [/mechanism design|incentive[- ]compatib|strategy-?proof|revelation principle|implementation theory|optimal mechanism|robust mechanism/i, 'mechanism design'],
+  [/information design|bayesian persuasion|\bpersua(sion|de)|cheap talk|\bsender\b/i, 'persuasion'],
+  [/\bcournot\b|\bbertrand\b|\boligopol|\bduopol/i, 'oligopoly'],
+  [/allocation mechanisms?|\bmechanisms? (for|with) (allocating|agents)/i, 'mechanism design'],
+  [/repeated (game|interaction)|coordination (game|problem)|folk theorem/i, 'repeated game'],
+  [/stable matching|matching mechanism|deferred acceptance|school choice|market design/i, 'market design'],
+  [/principal[- –]agent|contract theory|optimal contract|dynamic contract|relational contract|incomplete contract/i, 'contract'],
+];
+// 这些词在实证论文里常只是研究对象，实证论文中不单独算
+const T5_SOFT = [
+  [/\bauctions?\b/i, 'auction'], [/\bbargaining\b/i, 'bargaining'], [/moral hazard|adverse selection/i, 'agency'],
+  [/\bsignal(l)?ing\b|\bscreening\b/i, 'signaling'], [/\bcollusion\b|\bcartels?\b/i, 'collusion'], [/\bcontests?\b|\btournaments?\b/i, 'contest'],
+  [/strategic(ally)? (interaction|complement|substitut|behavio|voting|communication|experimentation|delegation|uncertainty|information|disclosure|agent|player|firm|voter)/i, 'strategic'],
+  [/\breputation/i, 'reputation'],
+];
+const T5_EMPIRICAL = new RegExp(EMPIRICAL.source + '|\\bwe use\\b|\\busing [^.]{0,40}data|data from|\\bwe document\\b|exploit|\\binstrument|\\bcausal|experiment|administrative|calibrat|quantitative|\\bestimates?\\b|\\bestimator|asymptotic', 'i');
+// 博弈论式的互动线索：摘要没写博弈论，但有策略互动或信息不对称
+const T5_CUE = /\bplayers?\b|\bprincipal\b|\bdesigner\b|\bprivate information\b|\basymmetric information\b|\bincomplete information\b|\bincentives?\b|\bstrategic\w*|\bvoters?\b|\bplatforms?\b|\bcompetition\b|\bcompet(e|ing)\b|\bcoalition\w*|\bhegemon\w*|\bcontacts\b|\bexporter\b/i;
+// 理论文章的写法
+const T5_THEORY = /\bwe (present|develop|propose|provide|study|analy[sz]e|consider|characteri[sz]e)\b[^.]{0,60}\b(model|theory|framework)\b|\ba (theory|model) (of|where|in which)\b|\bthis paper develops\b|\bwe show that\b|\bwe characteri[sz]e\b|\boptimal (response|strategy|mechanism|design)\b/i;
+// 这些论文多用均衡分析，但不是博弈论
+const T5_MACRO = /general equilibrium|spatial equilibrium|business cycle|monetary policy|new keynesian|macroeconom|macroprudential|economic growth|heterogeneous[- ]agent|\bHANK\b|\bDSGE\b|inflation|aggregate (demand|productivity|output)|\bGDP\b|asset pric|interest rate|capital flows|exchange rate|technological change|structural change/i;
+// 没有摘要时，只看标题里的线索
+const T5_TITLE_HINT = /strategic|\ba theory of\b|\bmechanisms?\b|\bcontracts?\b|\bauctions?\b|\bbargaining\b|persuasion|\bsignal(l)?ing\b|\bscreening\b|\bcompetition\b|\bcollusion\b/i;
+
+function classifyTop5(p) {
+  const title = p.title || '';
+  const abs = p.abstract || '';
+  const of = (list, text) => [...new Set(list.filter(([re]) => re.test(text)).map(x => x[1]))];
+  if (!abs) {
+    const h = of(T5_HARD, title.replace(NOT_GAME, ' '));
+    return h.length || T5_TITLE_HINT.test(title) ? { bin: 'A', label: '疑似', evidence: h.length ? h : ['标题线索'] } : { bin: 'B', label: '待判定', evidence: [], showPending: true };
+  }
+  const all = `${title} ${abs}`;
+  // 宏观搜寻模型里的 Nash bargaining 只是工资设定方式
+  const clean = all.replace(NOT_GAME, ' ').replace(/nash[- ]bargain\w*/gi, ' ');
+  const hard = of(T5_HARD, clean);
+  const soft = of(T5_SOFT, clean);
+  const empirical = T5_EMPIRICAL.test(all);
+  if (hard.length) return { bin: 'A', label: '明确', evidence: [...hard, ...soft] };
+  if (soft.length && !empirical) return { bin: 'A', label: '明确', evidence: soft };
+  if (!empirical && !T5_MACRO.test(all) && T5_CUE.test(abs) && T5_THEORY.test(all)) return { bin: 'A', label: '疑似', evidence: ['理论模型'] };
+  return { bin: 'B', label: '', evidence: [] };
+}
+
 // ---------- 抓取 ----------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const strip = s => (s || '').replace(/<!\[CDATA\[|\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&lt;[^&]*&gt;/g, ' ')
@@ -155,11 +209,11 @@ async function crossref(filter, limit = 20000) {
   }
   return out;
 }
-async function openalex(issn) {
+async function openalex(issn, since) {
   const out = [];
   let cursor = '*';
   while (cursor) {
-    const u = `https://api.openalex.org/works?filter=primary_location.source.issn:${issn},from_publication_date:${SINCE}&per-page=200&cursor=${encodeURIComponent(cursor)}&select=doi,title,publication_date,abstract_inverted_index`;
+    const u = `https://api.openalex.org/works?filter=primary_location.source.issn:${issn},from_publication_date:${since}&per-page=200&cursor=${encodeURIComponent(cursor)}&select=doi,title,publication_date,abstract_inverted_index`;
     const j = await fetchJson(u);
     if (!j || !j.results) break;
     out.push(...j.results);
@@ -170,10 +224,10 @@ async function openalex(issn) {
 }
 
 async function repecIndex(code) {
-  const t = await fetchText(`https://ideas.repec.org/s/eee/${code}.html`);
+  const t = await fetchText(`https://ideas.repec.org/s/${code.includes('/') ? code : 'eee/' + code}.html`);
   const m = new Map();
   if (!t) return m;
-  for (const x of t.matchAll(/<A HREF="(\/a\/eee\/[^"]+)">([^<]+)<\/A>/gi)) m.set(norm(strip(x[2])), x[1]);
+  for (const x of t.matchAll(/<A HREF="(\/a\/[^"]+)">([^<]+)<\/A>/gi)) m.set(norm(strip(x[2])), x[1]);
   return m;
 }
 async function repecAbstract(href, cache) {
@@ -205,20 +259,22 @@ async function collect() {
   fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
   const cache = fs.existsSync(CACHE_FILE) ? JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')) : {};
   for (const [name, issn, repec] of JOURNALS) {
+    if (ONLY_TOP5 && !TOP5.has(name)) continue;
+    const since = TOP5.has(name) ? T5_SINCE : SINCE;
     const byDoi = new Map();
-    const cr = await crossref(`issn:${issn},from-created-date:${SINCE}`);
+    const cr = await crossref(`issn:${issn},from-created-date:${since}`);
     for (const x of cr) {
       if (x.type && x.type !== 'journal-article') continue;
       byDoi.set(x.DOI.toLowerCase(), { source: name, doi: x.DOI, title: strip((x.title || [])[0]), abstract: strip(x.abstract), url: x.URL, date: (x.created || {})['date-time'] || '' });
     }
-    for (const x of await openalex(issn)) {
+    for (const x of await openalex(issn, since)) {
       const doi = (x.doi || '').replace('https://doi.org/', '').toLowerCase();
       if (!doi) continue;
       const e = byDoi.get(doi);
       const a = invert(x.abstract_inverted_index);
       if (e) { if (!e.abstract) e.abstract = a; } else byDoi.set(doi, { source: name, doi, title: strip(x.title), abstract: a, url: 'https://doi.org/' + doi, date: x.publication_date });
     }
-    const list = [...byDoi.values()].filter(p => p.title && !/^(editorial board|issue information|front matter|table of contents|erratum|corrigendum)/i.test(p.title));
+    const list = [...byDoi.values()].filter(p => p.title && !/^(editorial board|issue information|front ?matter|back ?matter|table of contents|erratum|corrigendum|report of|annual report|notice|forthcoming papers|recent referees|submission|editors?'? ?report|fellows of|election of|acknowledg|volume information|minutes of|the econometric society)/i.test(p.title));
     if (repec) {
       const idx = await repecIndex(repec);
       for (const p of list) {
@@ -232,6 +288,7 @@ async function collect() {
     papers.push(...list);
     console.error(name, stats[name]);
   }
+  if (ONLY_TOP5) return { papers, stats };
   const ss = await crossref(`prefix:10.2139,from-created-date:${SSRN_SINCE}`, 60000);
   const ssrn = ss.map(x => ({ source: 'SSRN', doi: x.DOI, title: strip((x.title || [])[0]), abstract: strip(x.abstract), url: 'https://doi.org/' + x.DOI, date: (x.created || {})['date-time'] || '' })).filter(p => p.title);
   stats.SSRN = { n: ssrn.length, abs: ssrn.filter(p => p.abstract).length };
@@ -251,9 +308,9 @@ const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(
 function rss(title, desc, items) {
   const body = items.map(p => {
     const snippet = p.abstract ? (p.abstract.length > 300 ? p.abstract.slice(0, 300) + '…' : p.abstract) : '暂无摘要，等摘要入库后会重新判定。';
-    const html = `<p><b>期刊/来源：</b>${esc(p.source)}　<b>主题：</b>${esc(p.topics.join('、'))}${p.evidence.length ? `　<b>判定依据：</b>${esc(p.evidence.join('、'))}` : ''}</p><p>${esc(snippet)}</p>`;
+    const html = `<p><b>期刊/来源：</b>${esc(p.source)}${p.topics.length ? `　<b>主题：</b>${esc(p.topics.join('、'))}` : ''}${p.evidence.length ? `　<b>判定依据：</b>${esc(p.evidence.join('、'))}` : ''}</p><p>${esc(snippet)}</p>`;
     const d = new Date(p.date);
-    const mark = p.label && p.label !== '待判定' ? `[${p.label}]` : '';
+    const mark = p.label && (p.label !== '待判定' || p.showPending) ? `[${p.label}]` : '';
     return `<item><title>${esc(`${mark}[${p.source}] ${p.title}`)}</title><link>${esc(p.url)}</link><guid isPermaLink="false">${esc(p.doi || p.url || p.title)}</guid>${isNaN(d) ? '' : `<pubDate>${d.toUTCString()}</pubDate>`}<description>${esc(html)}</description></item>`;
   }).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>${esc(title)}</title><description>${esc(desc)}</description><link>https://www.inoreader.com/</link>\n${body}\n</channel></rss>\n`;
@@ -265,19 +322,27 @@ function rss(title, desc, items) {
   if (args['save-raw']) fs.writeFileSync(args['save-raw'], JSON.stringify(raw));
   const seen = new Set();
   const bins = { A: [], B: [], C: [] };
+  const top5 = { A: [], B: [] };
   for (const p of papers) {
     const k = norm(p.title);
     if (seen.has(k)) continue;
     seen.add(k);
     const c = classify(p);
-    if (c) bins[c.bin].push({ ...p, ...c });
+    if (TOP5.has(p.source)) {
+      const t = classifyTop5(p);
+      top5[t.bin].push({ ...p, ...t, topics: c ? c.topics : [] });
+    }
+    // Top 5 回看一年，但主题订阅 A/B/C 仍用原来的时间窗口
+    if (c && (!TOP5.has(p.source) || String(p.date).slice(0, 10) >= SINCE)) bins[c.bin].push({ ...p, ...c });
   }
-  for (const b of Object.values(bins)) b.sort((x, y) => String(y.date).localeCompare(String(x.date)));
+  for (const b of [...Object.values(bins), ...Object.values(top5)]) b.sort((x, y) => String(y.date).localeCompare(String(x.date)));
   fs.mkdirSync(OUT, { recursive: true });
   fs.writeFileSync(path.join(OUT, 'A-game-theory.xml'), rss('A 重点：主题相关 + 博弈论', '数据经济、平台经济、供应链、人工智能主题中使用博弈论方法的论文；标题带[疑似]的是摘要未明说、但看起来是理论模型的论文', bins.A.slice(0, 500)));
   fs.writeFileSync(path.join(OUT, 'B-related-non-game.xml'), rss('B 参考：主题相关 · 未用博弈论', '主题相关但摘要中未见博弈论方法的论文', bins.B.slice(0, 500)));
   fs.writeFileSync(path.join(OUT, 'C-pending.xml'), rss('C 待判定：暂无摘要', '标题主题相关但还没有摘要，暂时无法判断方法；摘要入库后会移到 A 或 B', bins.C.slice(0, 300)));
-  fs.writeFileSync(path.join(OUT, 'result.json'), JSON.stringify({ since: SINCE, ssrnSince: SSRN_SINCE, stats, bins }, null, 1));
-  console.log(JSON.stringify({ A: bins.A.length, B: bins.B.length, C: bins.C.length, total: seen.size }));
+  fs.writeFileSync(path.join(OUT, 'T5-game-theory.xml'), rss('T5 重点：经济学 Top 5 · 博弈论', 'AER、Econometrica、JPE、QJE、RES 中使用博弈论方法的论文，不限主题；标题带[疑似]的是摘要未明说、但看起来是理论模型的论文', top5.A.slice(0, 300)));
+  fs.writeFileSync(path.join(OUT, 'T5-other.xml'), rss('T5 其他：经济学 Top 5 · 其余论文', 'AER、Econometrica、JPE、QJE、RES 中摘要未见博弈论方法的论文；标题带[待判定]的是暂无摘要的论文', top5.B.slice(0, 500)));
+  fs.writeFileSync(path.join(OUT, 'result.json'), JSON.stringify({ since: SINCE, ssrnSince: SSRN_SINCE, stats, bins, top5 }, null, 1));
+  console.log(JSON.stringify({ A: bins.A.length, B: bins.B.length, C: bins.C.length, T5A: top5.A.length, T5B: top5.B.length, total: seen.size }));
   console.log(JSON.stringify(stats));
 })();
